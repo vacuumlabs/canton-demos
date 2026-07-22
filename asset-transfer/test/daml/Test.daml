@@ -1,0 +1,142 @@
+module Test where
+
+import Main
+import Daml.Script
+import DA.Assert ((===))
+import DA.List (sort)
+import DA.Time (hours)
+
+-- Daml Script runs in STATIC time mode: the clock starts at the Unix epoch
+-- (1970-01-01T00:00:00Z) and only passTime/setTime move it, forward only.
+-- (The UI runs against `dpm sandbox` in WALL-CLOCK mode, where ledger time is
+-- real UTC.) `oneDay` is the TTL we hand to ProposeTransfer, in seconds.
+oneDay : Int
+oneDay = 86400
+
+-- Allocate Alice and Bob and mint Alice a GOLD 100.0 asset.
+setup : Script (Party, Party, ContractId Asset)
+setup = script do
+  alice <- allocatePartyByHint (PartyIdHint "Alice")
+  bob   <- allocatePartyByHint (PartyIdHint "Bob")
+  gold  <- submit alice do
+    createCmd Asset with owner = alice; issuer = alice; name = "GOLD"; quantity = 100.0
+  pure (alice, bob, gold)
+
+-- Helper: the quantities a party currently owns (sorted for stable comparison).
+ownedQuantities : Party -> Script [Decimal]
+ownedQuantities p = do
+  assets <- query @Asset p
+  pure $ sort [ a.quantity | (_, a) <- assets, a.owner == p ]
+
+testHappyPath : Script ()
+testHappyPath = script do
+  (alice, bob, gold) <- setup
+  (prop, _remainder) <- submit alice do
+    exerciseCmd gold ProposeTransfer with recipient = bob, amount = 30.0, ttlSeconds = oneDay
+  -- Alice keeps the 70.0 remainder; the 30.0 is escrowed in the proposal.
+  aliceAfterPropose <- ownedQuantities alice
+  aliceAfterPropose === [70.0]
+  _ <- submit bob do exerciseCmd prop Accept
+  bobFinal   <- ownedQuantities bob
+  aliceFinal <- ownedQuantities alice
+  bobFinal   === [30.0]
+  aliceFinal === [70.0]
+  remainingProps <- query @TransferProposal alice
+  remainingProps === []
+
+testRejectPath : Script ()
+testRejectPath = script do
+  (alice, bob, gold) <- setup
+  (prop, _remainder) <- submit alice do
+    exerciseCmd gold ProposeTransfer with recipient = bob, amount = 30.0, ttlSeconds = oneDay
+  _ <- submit bob do exerciseCmd prop Reject
+  aliceFinal <- ownedQuantities alice
+  bobFinal   <- ownedQuantities bob
+  aliceFinal === [30.0, 70.0]   -- got the 30.0 back alongside the 70.0
+  bobFinal   === []
+  remainingProps <- query @TransferProposal alice
+  remainingProps === []
+
+testCancelPath : Script ()
+testCancelPath = script do
+  (alice, bob, gold) <- setup
+  (prop, _remainder) <- submit alice do
+    exerciseCmd gold ProposeTransfer with recipient = bob, amount = 30.0, ttlSeconds = oneDay
+  _ <- submit alice do exerciseCmd prop Cancel
+  aliceFinal <- ownedQuantities alice
+  bobFinal   <- ownedQuantities bob
+  aliceFinal === [30.0, 70.0]   -- reclaimed the 30.0 alongside the 70.0
+  bobFinal   === []
+  remainingProps <- query @TransferProposal alice
+  remainingProps === []
+
+testOverdraftFails : Script ()
+testOverdraftFails = script do
+  (alice, bob, gold) <- setup
+  submitMustFail alice do
+    exerciseCmd gold ProposeTransfer with recipient = bob, amount = 150.0, ttlSeconds = oneDay
+
+testZeroAmountFails : Script ()
+testZeroAmountFails = script do
+  (alice, bob, gold) <- setup
+  submitMustFail alice do
+    exerciseCmd gold ProposeTransfer with recipient = bob, amount = 0.0, ttlSeconds = oneDay
+
+-- Accept succeeds while the proposal is still within its TTL.
+testAcceptBeforeExpiry : Script ()
+testAcceptBeforeExpiry = script do
+  (alice, bob, gold) <- setup
+  (prop, _remainder) <- submit alice do
+    exerciseCmd gold ProposeTransfer with recipient = bob, amount = 30.0, ttlSeconds = oneDay
+  passTime (hours 1)
+  _ <- submit bob do exerciseCmd prop Accept
+  bobFinal <- ownedQuantities bob
+  bobFinal === [30.0]
+
+-- Accept fails once ledger time passes expiresAt; the proposal is untouched.
+testExpiredAcceptFails : Script ()
+testExpiredAcceptFails = script do
+  (alice, bob, gold) <- setup
+  (prop, _remainder) <- submit alice do
+    exerciseCmd gold ProposeTransfer with recipient = bob, amount = 30.0, ttlSeconds = oneDay
+  passTime (hours 25)
+  submitMustFail bob do exerciseCmd prop Accept
+  remainingProps <- query @TransferProposal alice
+  length remainingProps === 1   -- failed Accept archived nothing
+
+-- After expiry, the recipient (a stakeholder) can sweep the escrow to the owner.
+testExpireCleanupReturnsEscrow : Script ()
+testExpireCleanupReturnsEscrow = script do
+  (alice, bob, gold) <- setup
+  (prop, _remainder) <- submit alice do
+    exerciseCmd gold ProposeTransfer with recipient = bob, amount = 30.0, ttlSeconds = oneDay
+  passTime (hours 25)
+  _ <- submit bob do exerciseCmd prop ExpireCleanup with actor = bob
+  aliceFinal <- ownedQuantities alice
+  aliceFinal === [30.0, 70.0]
+  remainingProps <- query @TransferProposal alice
+  remainingProps === []
+
+-- A non-owner, non-recipient stakeholder (the issuer) can also sweep after expiry.
+testCleanupByIssuer : Script ()
+testCleanupByIssuer = script do
+  alice   <- allocatePartyByHint (PartyIdHint "Alice")
+  bob     <- allocatePartyByHint (PartyIdHint "Bob")
+  charlie <- allocatePartyByHint (PartyIdHint "Charlie")
+  gold <- submit alice do
+    createCmd Asset with owner = alice; issuer = charlie; name = "GOLD"; quantity = 100.0
+  (prop, _remainder) <- submit alice do
+    exerciseCmd gold ProposeTransfer with recipient = bob, amount = 30.0, ttlSeconds = oneDay
+  passTime (hours 25)
+  _ <- submit charlie do exerciseCmd prop ExpireCleanup with actor = charlie
+  aliceFinal <- ownedQuantities alice
+  aliceFinal === [30.0, 70.0]
+
+-- Cleanup is rejected before the deadline (the now > expiresAt guard).
+testCleanupBeforeExpiryFails : Script ()
+testCleanupBeforeExpiryFails = script do
+  (alice, bob, gold) <- setup
+  (prop, _remainder) <- submit alice do
+    exerciseCmd gold ProposeTransfer with recipient = bob, amount = 30.0, ttlSeconds = oneDay
+  passTime (hours 1)   -- still well within the 1-day TTL
+  submitMustFail bob do exerciseCmd prop ExpireCleanup with actor = bob

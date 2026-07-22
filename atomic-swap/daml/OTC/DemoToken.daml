@@ -1,0 +1,205 @@
+-- | A deliberately small CIP-0056 token registry used by the local demo and
+-- tests. OTC.Model depends only on the standard interfaces and also works with
+-- other registries that implement Holding, AllocationFactory, and Allocation.
+module OTC.DemoToken where
+
+import Splice.Api.Token.MetadataV1
+import Splice.Api.Token.HoldingV1
+import Splice.Api.Token.AllocationV1
+import Splice.Api.Token.AllocationInstructionV1
+
+template DemoHolding
+  with
+    admin : Party
+    owner : Party
+    instrumentId : InstrumentId
+    amount : Decimal
+  where
+    signatory admin, owner
+    ensure amount > 0.0 && instrumentId.admin == admin
+
+    interface instance Holding for DemoHolding where
+      view = HoldingView with
+        owner
+        instrumentId
+        amount
+        lock = None
+        meta = emptyMetadata
+
+template DemoLockedHolding
+  with
+    admin : Party
+    owner : Party
+    instrumentId : InstrumentId
+    amount : Decimal
+    settlement : SettlementInfo
+    receiver : Party
+  where
+    signatory admin, owner
+    observer settlement.executor, receiver
+    ensure amount > 0.0 && instrumentId.admin == admin
+
+    interface instance Holding for DemoLockedHolding where
+      view = HoldingView with
+        owner
+        instrumentId
+        amount
+        lock = Some Lock with
+          holders = [admin]
+          expiresAt = Some settlement.settleBefore
+          expiresAfter = None
+          context = Some ("OTC allocation " <> settlement.settlementRef.id)
+        meta = emptyMetadata
+
+template DemoAllocation
+  with
+    admin : Party
+    allocation : AllocationSpecification
+    lockedHoldingCid : ContractId DemoLockedHolding
+  where
+    signatory admin, allocation.transferLeg.sender
+    observer allocation.transferLeg.receiver, allocation.settlement.executor
+
+    interface instance Allocation for DemoAllocation where
+      view = AllocationView with
+        allocation
+        holdingCids = [toInterfaceContractId @Holding lockedHoldingCid]
+        meta = emptyMetadata
+
+      allocation_executeTransferImpl _selfCid arg = do
+        now <- getTime
+        assertMsg "The settlement deadline has passed"
+          (now < allocation.settlement.settleBefore)
+        locked <- fetch lockedHoldingCid
+        assertMsg "The locked holding does not match the allocation"
+          ( locked.owner == allocation.transferLeg.sender
+            && locked.instrumentId == allocation.transferLeg.instrumentId
+            && locked.amount == allocation.transferLeg.amount
+          )
+        archive lockedHoldingCid
+        receiverCid <- create DemoHolding with
+          admin
+          owner = allocation.transferLeg.receiver
+          instrumentId = allocation.transferLeg.instrumentId
+          amount = allocation.transferLeg.amount
+        pure Allocation_ExecuteTransferResult with
+          senderHoldingCids = []
+          receiverHoldingCids = [toInterfaceContractId @Holding receiverCid]
+          meta = arg.extraArgs.meta
+
+      allocation_cancelImpl _selfCid arg = do
+        locked <- fetch lockedHoldingCid
+        archive lockedHoldingCid
+        senderCid <- create DemoHolding with
+          admin
+          owner = allocation.transferLeg.sender
+          instrumentId = locked.instrumentId
+          amount = locked.amount
+        pure Allocation_CancelResult with
+          senderHoldingCids = [toInterfaceContractId @Holding senderCid]
+          meta = arg.extraArgs.meta
+
+      allocation_withdrawImpl _selfCid arg = do
+        now <- getTime
+        assertMsg "The allocation can no longer be withdrawn"
+          (now < allocation.settlement.allocateBefore)
+        locked <- fetch lockedHoldingCid
+        archive lockedHoldingCid
+        senderCid <- create DemoHolding with
+          admin
+          owner = allocation.transferLeg.sender
+          instrumentId = locked.instrumentId
+          amount = locked.amount
+        pure Allocation_WithdrawResult with
+          senderHoldingCids = [toInterfaceContractId @Holding senderCid]
+          meta = arg.extraArgs.meta
+
+template DemoTokenRules
+  with
+    admin : Party
+    supportedInstrumentIds : [Text]
+    observers : [Party]
+  where
+    signatory admin
+    observer observers
+    ensure not (null supportedInstrumentIds)
+
+    nonconsuming choice Mint : ContractId Holding
+      with
+        owner : Party
+        instrumentId : InstrumentId
+        amount : Decimal
+      controller admin, owner
+      do
+        assertMsg "Unexpected instrument admin" (instrumentId.admin == admin)
+        assertMsg "Unsupported instrument" (instrumentId.id `elem` supportedInstrumentIds)
+        assertMsg "Mint amount must be positive" (amount > 0.0)
+        cid <- create DemoHolding with admin; owner; instrumentId; amount
+        pure (toInterfaceContractId @Holding cid)
+
+    interface instance AllocationFactory for DemoTokenRules where
+      view = AllocationFactoryView with admin; meta = emptyMetadata
+
+      allocationFactory_allocateImpl _selfCid arg = do
+        let specification = arg.allocation
+            settlement = specification.settlement
+            leg = specification.transferLeg
+        now <- getTime
+        assertMsg "Unexpected registry admin" (arg.expectedAdmin == admin)
+        assertMsg "Unexpected instrument admin" (leg.instrumentId.admin == admin)
+        assertMsg "Unsupported instrument" (leg.instrumentId.id `elem` supportedInstrumentIds)
+        assertMsg "Allocation sender must differ from receiver" (leg.sender /= leg.receiver)
+        assertMsg "Allocation amount must be positive" (leg.amount > 0.0)
+        assertMsg "requestedAt is in the future" (arg.requestedAt <= now)
+        assertMsg "Allocation deadline has passed" (now < settlement.allocateBefore)
+        assertMsg "Settlement deadline must follow allocation deadline"
+          (settlement.allocateBefore < settlement.settleBefore)
+        assertMsg "At least one holding is required" (not $ null arg.inputHoldingCids)
+
+        total <- archiveAndSum leg.sender leg.instrumentId arg.inputHoldingCids
+        assertMsg "Insufficient holdings for allocation" (total >= leg.amount)
+
+        lockedCid <- create DemoLockedHolding with
+          admin
+          owner = leg.sender
+          instrumentId = leg.instrumentId
+          amount = leg.amount
+          settlement
+          receiver = leg.receiver
+        allocationCid <- create DemoAllocation with
+          admin
+          allocation = specification
+          lockedHoldingCid = lockedCid
+        changeCids <- if total > leg.amount
+          then do
+            changeCid <- create DemoHolding with
+              admin
+              owner = leg.sender
+              instrumentId = leg.instrumentId
+              amount = total - leg.amount
+            pure [toInterfaceContractId @Holding changeCid]
+          else pure []
+        pure AllocationInstructionResult with
+          output = AllocationInstructionResult_Completed with
+            allocationCid = toInterfaceContractId @Allocation allocationCid
+          senderChangeCids = changeCids
+          meta = arg.extraArgs.meta
+
+      allocationFactory_publicFetchImpl _selfCid arg = do
+        assertMsg "Unexpected registry admin" (arg.expectedAdmin == admin)
+        pure AllocationFactoryView with admin; meta = emptyMetadata
+
+archiveAndSum : Party -> InstrumentId -> [ContractId Holding] -> Update Decimal
+archiveAndSum expectedOwner expectedInstrument holdingCids = do
+  amounts <- forA holdingCids $ \holdingCid -> do
+    holding <- fetch holdingCid
+    let holdingView = view holding
+    assertMsg "Holding owner does not match allocation sender"
+      (holdingView.owner == expectedOwner)
+    assertMsg "Holding instrument does not match allocation instrument"
+      (holdingView.instrumentId == expectedInstrument)
+    assertMsg "Locked holdings cannot fund another allocation"
+      (holdingView.lock == None)
+    archive holdingCid
+    pure holdingView.amount
+  pure (sum amounts)

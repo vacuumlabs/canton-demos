@@ -1,0 +1,251 @@
+-- | Canton Token Standard (CIP-0056) holdings, Task 1.
+--
+-- Defines a concrete, owner-signed `Holding` that implements the standard
+-- `Splice.Api.Token.HoldingV1.Holding` interface, plus a light `Instrument`
+-- metadata contract. Later tasks add transfer logic; this module deliberately
+-- carries no choices beyond template defaults (YAGNI).
+module Token where
+
+import qualified DA.TextMap as TextMap
+import Splice.Api.Token.MetadataV1 (Metadata(..))
+-- The interface is imported qualified so its name does not clash with our own
+-- `Holding` template; the plain data types are imported unqualified.
+import qualified Splice.Api.Token.HoldingV1 as HoldingV1
+import Splice.Api.Token.HoldingV1
+  ( HoldingView(..)
+  , InstrumentId(..)
+  , Lock(..)
+  )
+-- The transfer-instruction module is imported qualified (as `TI`) so its
+-- `TransferInstruction`/`TransferFactory` INTERFACES do not clash with our
+-- concrete templates of the same name; the plain data types are imported
+-- unqualified since they carry no such clash.
+import qualified Splice.Api.Token.TransferInstructionV1 as TI
+import Splice.Api.Token.TransferInstructionV1
+  ( Transfer(..)
+  , TransferInstructionResult(..)
+  , TransferInstructionResult_Output(..)
+  , TransferInstructionStatus(..)
+  , TransferInstructionView(..)
+  , TransferFactoryView(..)
+  )
+
+-- | An empty `Metadata` bag.
+--
+-- We construct it directly from the exported `Metadata` constructor rather than
+-- importing the package's `emptyMetadata`: in a data-dependency the latter is a
+-- decompiled stub whose body is `error "data-dependency stub"`, so referencing
+-- it is not safe. `Metadata with values = TextMap.empty` is equivalent and real.
+emptyMeta : Metadata
+emptyMeta = Metadata with values = TextMap.empty
+
+-- | The lock holders of an optional lock (empty when unlocked).
+lockHolders : Optional Lock -> [Party]
+lockHolders = optional [] (.holders)
+
+-- | A light on-ledger record describing an instrument (the "what" a holding is
+-- denominated in). metadata-v1 exposes only data types plus the generic
+-- `AnyContract` disclosure interface (an opaque wrapper, empty view) -- it does
+-- NOT define an implementable, instrument-specific metadata interface. So
+-- `Instrument` is a plain admin-signed record, per the Task 1 criteria.
+template Instrument
+  with
+    admin : Party
+    id : Text
+    name : Text
+    symbol : Text
+  where
+    signatory admin
+
+-- | An owner-signed holding of `amount` units of `instrumentId`.
+--
+-- TEACHING NOTE: real Canton Coin makes the registry `admin` a signatory of
+-- every holding, so any state change requires the registry's authority (and its
+-- off-ledger choiceContext). Here `Holding` is OWNER-signed instead: the
+-- registry `admin` is only an observer. That makes transfers self-authorizing
+-- (the owner alone can spend) without threading a registry choiceContext -- an
+-- intentional simplification for clarity, not a faithful production model.
+template Holding
+  with
+    instrumentId : InstrumentId
+    owner : Party
+    amount : Decimal
+    lock : Optional Lock
+    meta : Metadata
+  where
+    signatory owner
+    -- The registry admin observes every holding; lock holders additionally
+    -- observe a locked holding so the party the funds are earmarked for can see
+    -- (and, when authorised, consume) it -- e.g. the transfer receiver needs to
+    -- see the locked holding in order to Accept the transfer.
+    observer instrumentId.admin, lockHolders lock
+    ensure amount > 0.0
+
+    interface instance HoldingV1.Holding for Holding where
+      view = HoldingView with
+        owner
+        instrumentId
+        amount
+        lock
+        meta
+
+-- | The lock applied to the transferred amount while a transfer instruction is
+-- pending: the receiver is named as the lock holder so the standard's
+-- lock-holder semantics record who the funds are earmarked for.
+transferLock : Party -> Lock
+transferLock receiver = Lock with
+  holders = [receiver]
+  expiresAt = None
+  expiresAfter = None
+  context = Some "fop-transfer"
+
+-- | A pending free-of-payment (FOP) transfer awaiting the receiver's decision.
+--
+-- Stores the `Transfer` spec, the registry `admin`, and the interface cid of the
+-- locked `Holding` that escrows the transferred amount.
+--
+-- AUTHORIZATION TEACHING NOTE: this contract is `signatory transfer.sender`,
+-- `observer transfer.receiver`. When the receiver exercises `Accept` (controller
+-- = receiver), the choice body runs with the receiver's authority PLUS this
+-- contract's signatory authority (the sender). That combined authority is
+-- exactly what lets a single transaction archive the sender-signed locked
+-- holding AND create the receiver-signed output holding. The standard's `Lock`
+-- expresses the same insight as a hand-rolled escrow: the sender pre-authorizes
+-- the movement by signing the instruction, and the receiver triggers it.
+template TransferInstruction
+  with
+    admin : Party
+    transfer : Transfer
+    lockedCid : ContractId HoldingV1.Holding
+  where
+    signatory transfer.sender
+    observer transfer.receiver
+
+    interface instance TI.TransferInstruction for TransferInstruction where
+      view = TransferInstructionView with
+        originalInstructionCid = None
+        transfer
+        status = TransferPendingReceiverAcceptance
+        meta = emptyMeta
+
+      -- Accept (receiver): only before `executeBefore`. Unlock to the receiver by
+      -- archiving the locked holding and creating a fresh unlocked one for them.
+      transferInstruction_acceptImpl _self _arg = do
+        now <- getTime
+        assertMsg "transfer must be accepted before executeBefore"
+          (now < transfer.executeBefore)
+        archive (fromInterfaceContractId @Holding lockedCid)
+        receiverCid <- create Holding with
+          instrumentId = transfer.instrumentId
+          owner = transfer.receiver
+          amount = transfer.amount
+          lock = None
+          meta = emptyMeta
+        pure TransferInstructionResult with
+          output = TransferInstructionResult_Completed with
+            receiverHoldingCids = [toInterfaceContractId @HoldingV1.Holding receiverCid]
+          senderChangeCids = []
+          meta = emptyMeta
+
+      -- Reject (receiver): return the escrowed funds to the sender.
+      transferInstruction_rejectImpl _self _arg =
+        returnFundsToSender transfer lockedCid
+
+      -- Withdraw (sender): return the escrowed funds to the sender. No time
+      -- guard, so the sender can always recover funds, including after expiry.
+      transferInstruction_withdrawImpl _self _arg =
+        returnFundsToSender transfer lockedCid
+
+      -- Update: registry-internal workflow step. This simplified FOP model has
+      -- no such steps. We abort rather than return `_Failed`: the choice is
+      -- consuming, and `_Failed` in the standard means the funds were returned to
+      -- the sender, so returning it here without returning funds would strand the
+      -- locked holding. Aborting is honest and cannot strand funds.
+      transferInstruction_updateImpl _self _arg =
+        abort "this simplified FOP model has no registry-internal workflow steps"
+
+-- | Archive the locked holding and hand the amount back to the sender as a fresh
+-- unlocked holding. Shared by Reject and Withdraw.
+returnFundsToSender : Transfer -> ContractId HoldingV1.Holding -> Update TransferInstructionResult
+returnFundsToSender transfer lockedCid = do
+  archive (fromInterfaceContractId @Holding lockedCid)
+  senderCid <- create Holding with
+    instrumentId = transfer.instrumentId
+    owner = transfer.sender
+    amount = transfer.amount
+    lock = None
+    meta = emptyMeta
+  pure TransferInstructionResult with
+    output = TransferInstructionResult_Completed with receiverHoldingCids = []
+    senderChangeCids = [toInterfaceContractId @HoldingV1.Holding senderCid]
+    meta = emptyMeta
+
+-- | Admin-signed factory that mints FOP transfers per the token standard.
+template TransferFactory
+  with
+    admin : Party
+  where
+    signatory admin
+
+    interface instance TI.TransferFactory for TransferFactory where
+      view = TransferFactoryView with admin; meta = emptyMeta
+
+      -- Transfer (sender): split the single input holding into an unlocked change
+      -- holding (remainder, back to the sender) and a locked holding (the
+      -- transferred amount, earmarked for the receiver), then create the pending
+      -- `TransferInstruction`.
+      transferFactory_transferImpl _self arg = do
+        let transfer = arg.transfer
+        assertMsg "expectedAdmin must match the factory admin"
+          (arg.expectedAdmin == admin)
+        assertMsg "transfer amount must be positive" (transfer.amount > 0.0)
+        -- The standard requires the transfer to fail once `executeBefore` has
+        -- passed, so the sender can safely retry with a fresh instruction.
+        now <- getTime
+        assertMsg "executeBefore must be in the future" (now < transfer.executeBefore)
+        inputCid <- case transfer.inputHoldingCids of
+          [cid] -> pure cid
+          _ -> abort "expected exactly one input holding"
+        input <- fetch (fromInterfaceContractId @Holding inputCid)
+        assertMsg "input holding owner must be the sender"
+          (input.owner == transfer.sender)
+        -- Guard against archiving one instrument and minting another.
+        assertMsg "input holding instrument must match the transfer instrument"
+          (input.instrumentId == transfer.instrumentId)
+        assertMsg "input holding must be unlocked" (input.lock == None)
+        assertMsg "input holding must cover the transfer amount"
+          (input.amount >= transfer.amount)
+        archive (fromInterfaceContractId @Holding inputCid)
+        let changeAmount = input.amount - transfer.amount
+        senderChangeCids <-
+          if changeAmount > 0.0
+            then do
+              changeCid <- create Holding with
+                instrumentId = input.instrumentId
+                owner = transfer.sender
+                amount = changeAmount
+                lock = None
+                meta = emptyMeta
+              pure [toInterfaceContractId @HoldingV1.Holding changeCid]
+            else pure []
+        lockedCid <- create Holding with
+          instrumentId = input.instrumentId
+          owner = transfer.sender
+          amount = transfer.amount
+          lock = Some (transferLock transfer.receiver)
+          meta = emptyMeta
+        instructionCid <- create TransferInstruction with
+          admin
+          transfer
+          lockedCid = toInterfaceContractId @HoldingV1.Holding lockedCid
+        pure TransferInstructionResult with
+          output = TransferInstructionResult_Pending with
+            transferInstructionCid = toInterfaceContractId @TI.TransferInstruction instructionCid
+          senderChangeCids
+          meta = emptyMeta
+
+      -- PublicFetch: disclose the factory view; validate the expected admin.
+      transferFactory_publicFetchImpl _self arg = do
+        assertMsg "expectedAdmin must match the factory admin"
+          (arg.expectedAdmin == admin)
+        pure TransferFactoryView with admin; meta = emptyMeta

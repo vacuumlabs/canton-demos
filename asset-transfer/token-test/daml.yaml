@@ -1,0 +1,14 @@
+name: learnDaml-token-test
+source: daml
+version: 0.0.1
+dependencies:
+  - daml-prim
+  - daml-stdlib
+  - daml-script
+data-dependencies:
+  - ../token/dars/splice-api-token-metadata-v1-1.0.0.dar
+  - ../token/dars/splice-api-token-holding-v1-1.0.0.dar
+  - ../token/dars/splice-api-token-transfer-instruction-v1-1.0.0.dar
+  - ../token/.daml/dist/learnDaml-token-0.0.1.dar
+build-options:
+  - --target=2.1

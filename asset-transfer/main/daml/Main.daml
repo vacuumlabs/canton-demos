@@ -1,0 +1,78 @@
+module Main where
+
+import DA.Time (addRelTime, seconds)
+
+template Asset with
+    owner    : Party      -- signatory: fully controls the asset
+    issuer   : Party      -- observer: who minted it
+    name     : Text
+    quantity : Decimal
+  where
+    signatory owner
+    observer issuer
+    ensure quantity > 0.0 && name /= ""
+
+    -- consuming: splits this asset, escrowing `amount` into a proposal
+    choice ProposeTransfer : (ContractId TransferProposal, Optional (ContractId Asset))
+      with
+        recipient  : Party
+        amount     : Decimal
+        ttlSeconds : Int
+      controller owner
+      do
+        assertMsg "amount must be positive"       (amount > 0.0)
+        assertMsg "amount cannot exceed quantity" (amount <= quantity)
+        assertMsg "ttl must be positive"          (ttlSeconds > 0)
+        now <- getTime                                   -- ledger time (teaching moment #1)
+        let expiresAt = addRelTime now (seconds ttlSeconds)
+        prop <- create TransferProposal with owner; recipient; issuer; name; amount; expiresAt
+        remainder <-
+          if amount == quantity
+            then pure None
+            else Some <$> create this with quantity = quantity - amount
+        pure (prop, remainder)
+
+template TransferProposal with
+    owner     : Party     -- signatory (proposer)
+    recipient : Party     -- observer; controls Accept/Reject
+    issuer    : Party     -- observer
+    name      : Text
+    amount    : Decimal
+    expiresAt : Time      -- absolute deadline, set at propose
+  where
+    signatory owner
+    observer recipient, issuer
+
+    -- recipient's authority is what allows the new (recipient-signed) Asset to exist
+    choice Accept : ContractId Asset
+      controller recipient
+      do
+        now <- getTime                                   -- teaching moment #2
+        assertMsg "proposal has expired" (now <= expiresAt)
+        create Asset with owner = recipient; issuer; name; quantity = amount
+
+    choice Reject : ContractId Asset            -- return escrowed amount to owner
+      controller recipient
+      do create Asset with owner; issuer; name; quantity = amount
+
+    choice Cancel : ContractId Asset            -- owner reclaims while pending
+      controller owner
+      do create Asset with owner; issuer; name; quantity = amount
+
+    -- any stakeholder may sweep an expired proposal; escrow returns to owner.
+    -- Daml treats a comma-separated `controller a, b, c` as CONJUNCTIVE (all
+    -- three must authorize together), so to let ANY single stakeholder act we
+    -- use a flexible controller: the submitter names themselves via `actor` and
+    -- we check they are in fact a stakeholder. owner is a signatory of this
+    -- proposal, so owner's authority is present in the choice body (the
+    -- owner-signed Asset can be created) regardless of who the actor is.
+    choice ExpireCleanup : ContractId Asset
+      with
+        actor : Party
+      controller actor
+      do
+        now <- getTime                                   -- teaching moment #3
+        assertMsg "actor must be a stakeholder"
+          (actor == owner || actor == recipient || actor == issuer)
+        assertMsg "proposal has not expired yet" (now > expiresAt)
+        create Asset with owner; issuer; name; quantity = amount

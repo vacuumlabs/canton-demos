@@ -1,0 +1,298 @@
+-- | Task 1 + Task 2 tests for the Canton Token Standard.
+--
+-- Task 1 proves that a locally-minted `Token.Holding` is observable THROUGH the
+-- standard `Holding` interface view. Task 2 exercises the propose/accept FOP
+-- transfer flow: `TransferFactory_Transfer` splits the sender's holding into an
+-- unlocked change holding plus a locked holding and creates a
+-- `TransferInstruction`; the receiver `Accept`s (unlock to receiver) while the
+-- sender/receiver can `Withdraw`/`Reject` (return funds to sender).
+--
+-- All assertions go through the standard interface views (`HoldingView`,
+-- `TransferInstructionResult`), never the concrete template payloads, to prove
+-- a token-standard-aware client can drive the flow without our concrete types.
+module Token.Test where
+
+-- `Token` is imported qualified: its `Holding`/`TransferInstruction`/
+-- `TransferFactory` templates must not clash with the standard interfaces of the
+-- same name (imported unqualified, since the tests work through the interfaces).
+import qualified Token
+import Daml.Script
+import DA.Assert ((===))
+import DA.List (sort)
+import DA.Time (hours, addRelTime)
+import qualified DA.TextMap as TextMap
+import Splice.Api.Token.HoldingV1 (Holding, HoldingView(..), InstrumentId(..))
+import Splice.Api.Token.TransferInstructionV1
+import Splice.Api.Token.MetadataV1 (Metadata(..), ChoiceContext(..), ExtraArgs(..))
+
+-- | Instrument id used throughout the tests.
+gold : Text
+gold = "GOLD"
+
+-- | An empty `ExtraArgs`. Built from the exported constructors rather than the
+-- package's `emptyExtraArgs`/`emptyChoiceContext` helpers: in a data-dependency
+-- those helper *values* are decompiled stubs (`error "data-dependency stub"`),
+-- whereas the record constructors are real.
+emptyExtraArgs : ExtraArgs
+emptyExtraArgs = ExtraArgs with
+  context = ChoiceContext with values = TextMap.empty
+  meta = Metadata with values = TextMap.empty
+
+-- | Test-only helper: mint an owner-signed `Holding` and hand it back as an
+-- interface contract id so callers work purely through the standard interface.
+mintHolding : Party -> Party -> Text -> Decimal -> Script (ContractId Holding)
+mintHolding admin owner instr amount = do
+  cid <- submit owner do
+    createCmd Token.Holding with
+      instrumentId = InstrumentId with admin; id = instr
+      owner
+      amount
+      lock = None
+      meta = Token.emptyMeta
+  pure (toInterfaceContractId @Holding cid)
+
+-- | Test-only helper: read a `Holding` back through its interface view.
+queryInterfaceViewFor : Party -> ContractId Holding -> Script HoldingView
+queryInterfaceViewFor reader hcid = do
+  Some hv <- queryInterfaceContractId reader hcid
+  pure hv
+
+-- | Allocate the standard three parties and create the admin-signed
+-- `TransferFactory`. Returns its interface contract id plus a `Disclosure`:
+-- the factory is signatory-admin only, so a sender cannot see it on-ledger. In
+-- production the registry hands the factory to wallets as a disclosed contract;
+-- we mirror that here so the sender can exercise `TransferFactory_Transfer`.
+--
+-- NOTE: being a nullary top-level `Script`, this helper also shows up as a
+-- (passing) no-op entry in `dpm test` output. That is harmless.
+setupFactory : Script (Party, Party, Party, ContractId TransferFactory, Disclosure)
+setupFactory = do
+  admin <- allocatePartyByHint (PartyIdHint "Registry")
+  alice <- allocatePartyByHint (PartyIdHint "Alice")
+  bob <- allocatePartyByHint (PartyIdHint "Bob")
+  fcid <- submit admin do createCmd Token.TransferFactory with admin
+  Some disc <- queryDisclosure admin fcid
+  pure (admin, alice, bob, toInterfaceContractId @TransferFactory fcid, disc)
+
+-- | Build a `Transfer` for `gold`, executable within the next hour.
+mkTransfer : Party -> Party -> Party -> Decimal -> ContractId Holding -> Time -> Transfer
+mkTransfer admin sender receiver amount holdingCid now = Transfer with
+  sender
+  receiver
+  amount
+  instrumentId = InstrumentId with admin; id = gold
+  requestedAt = now
+  executeBefore = addRelTime now (hours 1)
+  inputHoldingCids = [holdingCid]
+  meta = Token.emptyMeta
+
+-- | Exercise `TransferFactory_Transfer` as the sender, disclosing the factory.
+proposeTransfer : Party -> ContractId TransferFactory -> Disclosure -> Transfer -> Script TransferInstructionResult
+proposeTransfer sender fcid disc transfer =
+  submit (actAs sender <> disclose disc) do
+    exerciseCmd fcid TransferFactory_Transfer with
+      expectedAdmin = transfer.instrumentId.admin
+      transfer
+      extraArgs = emptyExtraArgs
+
+-- | Extract the pending `TransferInstruction` cid from a transfer result.
+pendingCid : TransferInstructionResult -> ContractId TransferInstruction
+pendingCid r = case r.output of
+  TransferInstructionResult_Pending{transferInstructionCid} -> transferInstructionCid
+  _ -> error "expected TransferInstructionResult_Pending"
+
+-- | Sorted amounts of `p`'s *unlocked* holdings, read through the interface view.
+-- Locked holdings are deliberately excluded: they are not spendable.
+ownedAmounts : Party -> Script [Decimal]
+ownedAmounts p = do
+  hs <- queryInterface @Holding p
+  pure $ sort [ v.amount | (_, Some v) <- hs, v.owner == p, v.lock == None ]
+
+-- | Assert `p`'s spendable (unlocked) amounts equal `expected`.
+assertOwned : Party -> [Decimal] -> Script ()
+assertOwned p expected = do
+  amts <- ownedAmounts p
+  amts === expected
+
+-- | Locked-holding views owned by `p` (lock is `Some _`).
+lockedHoldings : Party -> Script [HoldingView]
+lockedHoldings p = do
+  hs <- queryInterface @Holding p
+  pure [ v | (_, Some v) <- hs, v.owner == p, v.lock /= None ]
+
+-- Task 1 ---------------------------------------------------------------------
+
+testMintAndView : Script ()
+testMintAndView = script do
+  admin <- allocatePartyByHint (PartyIdHint "Registry")
+  alice <- allocatePartyByHint (PartyIdHint "Alice")
+  hcid <- mintHolding admin alice gold 100.0
+  hv <- queryInterfaceViewFor alice hcid
+  hv.owner === alice
+  hv.amount === 100.0
+  hv.lock === None
+  hv.instrumentId === InstrumentId with admin; id = gold
+
+testInstrumentSmoke : Script ()
+testInstrumentSmoke = script do
+  admin <- allocatePartyByHint (PartyIdHint "Registry")
+  _ <- submit admin do
+    createCmd Token.Instrument with
+      admin
+      id = gold
+      name = "Gold"
+      symbol = "XAU"
+  pure ()
+
+testHoldingEnsurePositive : Script ()
+testHoldingEnsurePositive = script do
+  admin <- allocatePartyByHint (PartyIdHint "Registry")
+  alice <- allocatePartyByHint (PartyIdHint "Alice")
+  submitMustFail alice do
+    createCmd Token.Holding with
+      instrumentId = InstrumentId with admin; id = gold
+      owner = alice
+      amount = 0.0
+      lock = None
+      meta = Token.emptyMeta
+
+-- Task 2: FOP transfer flow --------------------------------------------------
+
+-- | Happy path: Alice transfers 30 of 100 to Bob; Bob accepts. Alice keeps the
+-- 70 change (unlocked); the 30 locked holding is consumed and Bob receives 30.
+testTransferAccept : Script ()
+testTransferAccept = script do
+  (admin, alice, bob, fcid, disc) <- setupFactory
+  hcid <- mintHolding admin alice gold 100.0
+  now <- getTime
+  result <- proposeTransfer alice fcid disc (mkTransfer admin alice bob 30.0 hcid now)
+  -- Change of 70 is returned to the sender immediately.
+  length result.senderChangeCids === 1
+  _ <- submit bob do
+    exerciseCmd (pendingCid result) TransferInstruction_Accept with extraArgs = emptyExtraArgs
+  assertOwned alice [70.0]
+  assertOwned bob [30.0]
+  -- No locked holdings remain once the transfer completes.
+  lockedHoldings alice >>= \ls -> length ls === 0
+
+-- | Reject returns the locked funds to the sender; the receiver gets nothing.
+testTransferReject : Script ()
+testTransferReject = script do
+  (admin, alice, bob, fcid, disc) <- setupFactory
+  hcid <- mintHolding admin alice gold 100.0
+  now <- getTime
+  result <- proposeTransfer alice fcid disc (mkTransfer admin alice bob 30.0 hcid now)
+  _ <- submit bob do
+    exerciseCmd (pendingCid result) TransferInstruction_Reject with extraArgs = emptyExtraArgs
+  assertOwned alice [30.0, 70.0]
+  assertOwned bob []
+
+-- | Withdraw (by the sender) returns the locked funds to the sender.
+testTransferWithdraw : Script ()
+testTransferWithdraw = script do
+  (admin, alice, bob, fcid, disc) <- setupFactory
+  hcid <- mintHolding admin alice gold 100.0
+  now <- getTime
+  result <- proposeTransfer alice fcid disc (mkTransfer admin alice bob 30.0 hcid now)
+  _ <- submit alice do
+    exerciseCmd (pendingCid result) TransferInstruction_Withdraw with extraArgs = emptyExtraArgs
+  assertOwned alice [30.0, 70.0]
+  assertOwned bob []
+
+-- | Overdraft: transferring more than the input holding holds must fail.
+testTransferOverdraftFail : Script ()
+testTransferOverdraftFail = script do
+  (admin, alice, bob, fcid, disc) <- setupFactory
+  hcid <- mintHolding admin alice gold 100.0
+  now <- getTime
+  submitMustFail (actAs alice <> disclose disc) do
+    exerciseCmd fcid TransferFactory_Transfer with
+      expectedAdmin = admin
+      transfer = mkTransfer admin alice bob 150.0 hcid now
+      extraArgs = emptyExtraArgs
+
+-- | Zero and negative transfer amounts must fail.
+testTransferZeroNegativeFail : Script ()
+testTransferZeroNegativeFail = script do
+  (admin, alice, bob, fcid, disc) <- setupFactory
+  hcid <- mintHolding admin alice gold 100.0
+  now <- getTime
+  submitMustFail (actAs alice <> disclose disc) do
+    exerciseCmd fcid TransferFactory_Transfer with
+      expectedAdmin = admin
+      transfer = mkTransfer admin alice bob 0.0 hcid now
+      extraArgs = emptyExtraArgs
+  submitMustFail (actAs alice <> disclose disc) do
+    exerciseCmd fcid TransferFactory_Transfer with
+      expectedAdmin = admin
+      transfer = mkTransfer admin alice bob (-5.0) hcid now
+      extraArgs = emptyExtraArgs
+
+-- | Instrument mismatch: the input holding's instrument must match the
+-- transfer's instrument, else a transfer could archive one instrument and mint
+-- another. Alice funds with GOLD but the transfer names SILVER (same admin).
+testTransferInstrumentMismatchFail : Script ()
+testTransferInstrumentMismatchFail = script do
+  (admin, alice, bob, fcid, disc) <- setupFactory
+  hcid <- mintHolding admin alice gold 100.0
+  now <- getTime
+  let transfer = (mkTransfer admin alice bob 30.0 hcid now) with
+        instrumentId = InstrumentId with admin; id = "SILVER"
+  submitMustFail (actAs alice <> disclose disc) do
+    exerciseCmd fcid TransferFactory_Transfer with
+      expectedAdmin = admin
+      transfer
+      extraArgs = emptyExtraArgs
+
+-- | Past deadline: the standard requires the transfer choice to fail once
+-- `executeBefore` is in the past.
+testTransferPastDeadlineFail : Script ()
+testTransferPastDeadlineFail = script do
+  (admin, alice, bob, fcid, disc) <- setupFactory
+  hcid <- mintHolding admin alice gold 100.0
+  now <- getTime
+  let transfer = (mkTransfer admin alice bob 30.0 hcid now) with
+        executeBefore = addRelTime now (hours (-1))
+  submitMustFail (actAs alice <> disclose disc) do
+    exerciseCmd fcid TransferFactory_Transfer with
+      expectedAdmin = admin
+      transfer
+      extraArgs = emptyExtraArgs
+
+-- | While pending, the locked holding is visible with `lock = Some _`, names the
+-- receiver as lock holder, and is excluded from the sender's spendable amounts.
+testLockVisibleWhilePending : Script ()
+testLockVisibleWhilePending = script do
+  (admin, alice, bob, fcid, disc) <- setupFactory
+  hcid <- mintHolding admin alice gold 100.0
+  now <- getTime
+  _ <- proposeTransfer alice fcid disc (mkTransfer admin alice bob 30.0 hcid now)
+  -- Spendable (unlocked) amount excludes the 30 that is locked.
+  assertOwned alice [70.0]
+  ls <- lockedHoldings alice
+  length ls === 1
+  let [locked] = ls
+  locked.amount === 30.0
+  case locked.lock of
+    Some l -> do
+      l.holders === [bob]
+      l.context === Some "fop-transfer"
+    None -> abort "locked holding must have a lock"
+
+-- | Expiry: after time passes beyond `executeBefore`, Accept fails, but the
+-- sender can still Withdraw to recover the funds.
+testTransferExpiry : Script ()
+testTransferExpiry = script do
+  (admin, alice, bob, fcid, disc) <- setupFactory
+  hcid <- mintHolding admin alice gold 100.0
+  now <- getTime
+  result <- proposeTransfer alice fcid disc (mkTransfer admin alice bob 30.0 hcid now)
+  passTime (hours 2)
+  -- Accept is guarded by `now < executeBefore`, so it must now fail.
+  submitMustFail bob do
+    exerciseCmd (pendingCid result) TransferInstruction_Accept with extraArgs = emptyExtraArgs
+  -- Withdraw has no time guard: the sender recovers the funds post-expiry.
+  _ <- submit alice do
+    exerciseCmd (pendingCid result) TransferInstruction_Withdraw with extraArgs = emptyExtraArgs
+  assertOwned alice [30.0, 70.0]
+  assertOwned bob []

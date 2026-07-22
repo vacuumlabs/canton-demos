@@ -1,0 +1,160 @@
+module OTC.Model where
+
+import DA.TextMap qualified as TextMap
+
+import Splice.Api.Token.MetadataV1
+import Splice.Api.Token.HoldingV1 (InstrumentId)
+import Splice.Api.Token.AllocationV1
+import Splice.Api.Token.AllocationRequestV1
+
+-- | Economic terms of a two-leg OTC delivery-versus-payment trade.
+-- The proposer is also the CIP-0056 settlement executor.
+data SwapTerms = SwapTerms with
+    tradeId : Text
+    offeredInstrument : InstrumentId
+    offeredAmount : Decimal
+    requestedInstrument : InstrumentId
+    requestedAmount : Decimal
+    requestedAt : Time
+    allocateBefore : Time
+    settleBefore : Time
+  deriving (Eq, Show)
+
+settlementInfo : Party -> AnyContractId -> SwapTerms -> SettlementInfo
+settlementInfo executor tradeCid terms = SettlementInfo with
+  executor
+  settlementRef = Reference with id = terms.tradeId; cid = Some tradeCid
+  requestedAt = terms.requestedAt
+  allocateBefore = terms.allocateBefore
+  settleBefore = terms.settleBefore
+  meta = emptyMetadata
+
+offeredLeg : Party -> Party -> SwapTerms -> TransferLeg
+offeredLeg proposer counterparty terms = TransferLeg with
+  sender = proposer
+  receiver = counterparty
+  amount = terms.offeredAmount
+  instrumentId = terms.offeredInstrument
+  meta = emptyMetadata
+
+requestedLeg : Party -> Party -> SwapTerms -> TransferLeg
+requestedLeg proposer counterparty terms = TransferLeg with
+  sender = counterparty
+  receiver = proposer
+  amount = terms.requestedAmount
+  instrumentId = terms.requestedInstrument
+  meta = emptyMetadata
+
+offeredAllocation : Party -> Party -> AnyContractId -> SwapTerms -> AllocationSpecification
+offeredAllocation proposer counterparty tradeCid terms = AllocationSpecification with
+  settlement = settlementInfo proposer tradeCid terms
+  transferLegId = "offered"
+  transferLeg = offeredLeg proposer counterparty terms
+
+requestedAllocation : Party -> Party -> AnyContractId -> SwapTerms -> AllocationSpecification
+requestedAllocation proposer counterparty tradeCid terms = AllocationSpecification with
+  settlement = settlementInfo proposer tradeCid terms
+  transferLegId = "requested"
+  transferLeg = requestedLeg proposer counterparty terms
+
+validateTerms : Party -> Party -> SwapTerms -> Bool
+validateTerms proposer counterparty terms =
+  proposer /= counterparty
+    && terms.tradeId /= ""
+    && terms.offeredAmount > 0.0
+    && terms.requestedAmount > 0.0
+    && terms.requestedAt < terms.allocateBefore
+    && terms.allocateBefore < terms.settleBefore
+
+-- | An accepted trade and a standard CIP-0056 AllocationRequest.
+--
+-- The allocations are created by the counterparties' wallets against the
+-- AllocationFactory exposed by each token registry. Settle only accepts the
+-- two allocations whose specifications exactly match this trade, and executes
+-- both Allocation_ExecuteTransfer choices as children of one Daml transaction.
+template AtomicSwap
+  with
+    proposer : Party
+    counterparty : Party
+    tradeCid : AnyContractId
+    terms : SwapTerms
+  where
+    signatory proposer, counterparty
+    ensure validateTerms proposer counterparty terms
+
+    interface instance AllocationRequest for AtomicSwap where
+      view = AllocationRequestView with
+        settlement = settlementInfo proposer tradeCid terms
+        transferLegs = TextMap.fromList
+          [ ("offered", offeredLeg proposer counterparty terms)
+          , ("requested", requestedLeg proposer counterparty terms)
+          ]
+        meta = emptyMetadata
+
+      allocationRequest_RejectImpl _selfCid arg = do
+        assertMsg "Only a trade counterparty may reject the allocation request"
+          (arg.actor == proposer || arg.actor == counterparty)
+        pure ChoiceExecutionMetadata with meta = emptyMetadata
+
+      allocationRequest_WithdrawImpl _selfCid _arg =
+        pure ChoiceExecutionMetadata with meta = emptyMetadata
+
+    choice Settle : (Allocation_ExecuteTransferResult, Allocation_ExecuteTransferResult)
+      with
+        offeredAllocationCid : ContractId Allocation
+        requestedAllocationCid : ContractId Allocation
+        offeredExtraArgs : ExtraArgs
+        requestedExtraArgs : ExtraArgs
+      controller proposer
+      do
+        now <- getTime
+        assertMsg "The settlement deadline has passed" (now < terms.settleBefore)
+        assertMsg "The two settlement legs must use distinct allocations"
+          (offeredAllocationCid /= requestedAllocationCid)
+
+        offeredContract <- fetch offeredAllocationCid
+        requestedContract <- fetch requestedAllocationCid
+        let offeredView = view offeredContract
+            requestedView = view requestedContract
+
+        assertMsg "The offered allocation does not match this trade"
+          (offeredView.allocation == offeredAllocation proposer counterparty tradeCid terms)
+        assertMsg "The requested allocation does not match this trade"
+          (requestedView.allocation == requestedAllocation proposer counterparty tradeCid terms)
+
+        offeredResult <- exercise offeredAllocationCid Allocation_ExecuteTransfer with
+          extraArgs = offeredExtraArgs
+        requestedResult <- exercise requestedAllocationCid Allocation_ExecuteTransfer with
+          extraArgs = requestedExtraArgs
+        pure (offeredResult, requestedResult)
+
+-- | A bilateral proposal. Accepting it creates the signed AtomicSwap and its
+-- standard AllocationRequest view; it does not move or reserve tokens yet.
+template SwapProposal
+  with
+    proposer : Party
+    counterparty : Party
+    terms : SwapTerms
+  where
+    signatory proposer
+    observer counterparty
+    ensure validateTerms proposer counterparty terms
+
+    choice Accept : ContractId AtomicSwap
+      controller counterparty
+      do
+        now <- getTime
+        assertMsg "The allocation deadline has passed" (now < terms.allocateBefore)
+        create AtomicSwap with
+          proposer
+          counterparty
+          tradeCid = coerceContractId self
+          terms
+
+    choice Reject : ()
+      controller counterparty
+      do pure ()
+
+    choice Cancel : ()
+      controller proposer
+      do pure ()
